@@ -25,11 +25,24 @@ def architect_agent(State: dict) -> dict:
 
     return {"task_plan": resp}
 
+def coder_agent(State: dict) -> dict:
+    steps = State['task_plan'].implementation_steps
+    current_step_idx = 0
+    current_task = steps[current_step_idx]
+    user_prompt = (
+        f"Task: {current_task.task_description}\n\n"
+    )
+    system_prompt = coder_system_prompt()
+    resp = llm.invoke(system_prompt + user_prompt)
+
+    return {"code": resp.content}
+
 graph = StateGraph(dict)
 graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
+graph.add_node("coder", coder_agent)
 graph.add_edge("planner", "architect")
-
+graph.add_edge("architect", "coder")
 graph.set_entry_point("planner")
 
 agent = graph.compile()
@@ -48,8 +61,4 @@ def taskplan_to_markdown(task_plan: TaskPlan) -> str:
 
 result = agent.invoke({"user_prompt": user_prompt})
 
-task_plan = result["task_plan"]
-
-markdown_output = taskplan_to_markdown(task_plan)
-
-print(markdown_output)
+print(result['code'])
