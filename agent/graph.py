@@ -1,6 +1,16 @@
+import os
+
 from dotenv import load_dotenv
+from langchain.agents import create_agent
+
+from agent.tools import read_file, write_file, list_files, get_current_directory
 
 load_dotenv()
+
+if not os.environ.get("GROQ_API_KEY"):
+    raise EnvironmentError(
+        "GROQ_API_KEY is not set. Add it to your .env file or environment before running."
+    )
 
 from langchain_groq import ChatGroq
 from prompts import *
@@ -8,9 +18,10 @@ from states import *
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 
-llm = ChatGroq(model="openai/gpt-oss-120b")
+_MAX_FILE_PREVIEW_CHARS = 8_000
 
-user_prompt = "Create a simple calculator web application"
+llm = ChatGroq(model="llama-3.3-70b-versatile")
+
 
 def planner_agent(State: dict) -> dict:
     user_prompt = State["user_prompt"]
@@ -25,40 +36,57 @@ def architect_agent(State: dict) -> dict:
 
     return {"task_plan": resp}
 
-def coder_agent(State: dict) -> dict:
-    steps = State['task_plan'].implementation_steps
-    current_step_idx = 0
-    current_task = steps[current_step_idx]
-    user_prompt = (
-        f"Task: {current_task.task_description}\n\n"
-    )
-    system_prompt = coder_system_prompt()
-    resp = llm.invoke(system_prompt + user_prompt)
+def coder_agent(state: dict) -> dict:
+    """LangGraph tool-using coder agent."""
+    coder_state: CoderState = state.get("coder_state")
+    if coder_state is None:
+        coder_state = CoderState(task_plan=state["task_plan"], current_step_idx=0)
 
-    return {"code": resp.content}
+    steps = coder_state.task_plan.implementation_steps
+    if coder_state.current_step_idx >= len(steps):
+        return {"coder_state": coder_state, "status": "DONE"}
+
+    current_task = steps[coder_state.current_step_idx]
+
+    existing_content = read_file.run(current_task.filepath)
+    if len(existing_content) > _MAX_FILE_PREVIEW_CHARS:
+        existing_content = existing_content[:_MAX_FILE_PREVIEW_CHARS] + "\n... [truncated for context]"
+
+    system_prompt = coder_system_prompt()
+    user_prompt = (
+        f"<task_description>\n{current_task.task_description}\n</task_description>\n"
+        f"<filepath>\n{current_task.filepath}\n</filepath>\n"
+        f"<existing_content>\n{existing_content}\n</existing_content>\n"
+        "Use write_file(path, content) to save your changes."
+    )
+
+    coder_tools = [read_file, write_file, list_files, get_current_directory]
+    react_agent = create_agent(llm, coder_tools)
+
+    react_agent.invoke({"messages": [{"role": "system", "content": system_prompt},
+                                     {"role": "user", "content": user_prompt}]})
+
+    coder_state.current_step_idx += 1
+    return {"coder_state": coder_state}
 
 graph = StateGraph(dict)
+
 graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
 graph.add_node("coder", coder_agent)
+
 graph.add_edge("planner", "architect")
 graph.add_edge("architect", "coder")
+graph.add_conditional_edges(
+    "coder",
+    lambda s: "END" if s.get("status") == "DONE" else "coder",
+    {"END": END, "coder": "coder"}
+)
+
 graph.set_entry_point("planner")
 
 agent = graph.compile()
-
-user_prompt = "create a simple calculator web application"
-
-def taskplan_to_markdown(task_plan: TaskPlan) -> str:
-    md = "# Implementation Plan\n\n"
-
-    for i, step in enumerate(task_plan.implementation_steps, 1):
-        md += f"## Step {i}: `{step.filepath}`\n\n"
-        md += f"{step.task_description}\n\n"
-        md += "---\n\n"
-
-    return md
-
-result = agent.invoke({"user_prompt": user_prompt})
-
-print(result['code'])
+if __name__ == "__main__":
+    result = agent.invoke({"user_prompt": "Build a colourful modern todo app in html css and js"},
+                          {"recursion_limit": 100})
+    print("Final State:", result)
